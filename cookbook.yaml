@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Serverless AI Recipe Book Infrastructure'
+Description: 'Serverless AI Recipe Book Infrastructure (Bilingual Edition)'
 
 Parameters:
   TelegramBotToken:
@@ -18,6 +18,11 @@ Parameters:
     Type: CommaDelimitedList
     Description: 'Comma-separated list of allowed Telegram user IDs'
     Default: ''
+  BotLanguage:
+    Type: String
+    Description: 'Language for bot responses and internal prompts (EN or RU)'
+    AllowedValues: ['EN', 'RU']
+    Default: 'RU'
 
 Resources:
   # 1. DynamoDB Table for Recipes
@@ -71,6 +76,7 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref RecipeTable
+          LANGUAGE: !Ref BotLanguage
       Code:
         # language=python
         ZipFile: |
@@ -84,11 +90,36 @@ Resources:
             def lambda_handler(event, context):
                 print("Bedrock Agent called this:", json.dumps(event))
                 table_name = os.environ['TABLE_NAME']
+                lang = os.environ.get('LANGUAGE', 'RU')
                 table = dynamodb.Table(table_name)
 
-                # Extract session_id passed by the webhook
-                session_id = event.get('sessionId', 'unknown_user')
+                # Dictionaries for localization
+                t = {
+                    'RU': {
+                        'saved': 'Рецепт "{name}" (Теги: {tags}) успешно сохранен!',
+                        'save_err': 'Ошибка: не передано имя или текст рецепта.',
+                        'not_found': 'Рецепты по данному запросу не найдены.',
+                        'list_header': 'Список рецептов в базе: \n- ',
+                        'updated': 'Рецепт "{name}" успешно обновлен!',
+                        'update_not_found': 'Ошибка: Рецепт "{name}" не найден. Сначала найди его точное название.',
+                        'update_err': 'Ошибка: не передано имя или обновленный текст.',
+                        'unknown_op': 'Неизвестная операция.',
+                        'db_err': 'Ошибка БД: {err}'
+                    },
+                    'EN': {
+                        'saved': 'Recipe "{name}" (Tags: {tags}) successfully saved!',
+                        'save_err': 'Error: recipe name or content not provided.',
+                        'not_found': 'No recipes found for this query.',
+                        'list_header': 'List of recipes in the database: \n- ',
+                        'updated': 'Recipe "{name}" successfully updated!',
+                        'update_not_found': 'Error: Recipe "{name}" not found. Please search for its exact name first.',
+                        'update_err': 'Error: recipe name or updated text not provided.',
+                        'unknown_op': 'Unknown operation.',
+                        'db_err': 'DB Error: {err}'
+                    }
+                }
 
+                session_id = event.get('sessionId', 'unknown_user')
                 response_content = ""
                 function_name = event.get('function', '')
                 params = event.get('parameters', [])
@@ -97,53 +128,43 @@ Resources:
                     if function_name == 'save_recipe':
                         recipe_name = next((p['value'] for p in params if p['name'] == 'recipe_name'), None)
                         recipe_content = next((p['value'] for p in params if p['name'] == 'recipe_content'), None)
-                        # Optional parameter: tags
-                        tags = next((p['value'] for p in params if p['name'] == 'tags'), 'Без тегов')
+                        tags = next((p['value'] for p in params if p['name'] == 'tags'), 'No tags' if lang == 'EN' else 'Без тегов')
 
                         if recipe_name and recipe_content:
                             table.put_item(Item={
                                 'RecipeId': recipe_name.lower(),
                                 'OriginalName': recipe_name,
                                 'Content': recipe_content,
-                                'UserId': session_id,  # Save author
-                                'Tags': tags           # Save tags
+                                'UserId': session_id,
+                                'Tags': tags
                             })
-                            response_content = f'Рецепт "{recipe_name}" (Теги: {tags}) успешно сохранен!'
+                            response_content = t[lang]['saved'].format(name=recipe_name, tags=tags)
                         else:
-                            response_content = "Ошибка: не передано имя или текст рецепта."
+                            response_content = t[lang]['save_err']
 
                     elif function_name == 'search_recipes':
                         keyword = next((p['value'] for p in params if p['name'] == 'keyword'), '').lower()
-                        # Additional filter parameters
                         only_my = next((p['value'] for p in params if p['name'] == 'only_my'), 'false').lower() == 'true'
                         names_only = next((p['value'] for p in params if p['name'] == 'names_only'), 'false').lower() == 'true'
 
                         fe = None
                         if keyword:
-                            # Match by RecipeId or Tags
                             fe = Attr('RecipeId').contains(keyword) | Attr('Tags').contains(keyword)
                         
-                        # Filter by author if requested
                         if only_my:
                             user_fe = Attr('UserId').eq(session_id)
                             fe = fe & user_fe if fe else user_fe
 
-                        if fe:
-                            response = table.scan(FilterExpression=fe)
-                        else:
-                            response = table.scan()
-
+                        response = table.scan(FilterExpression=fe) if fe else table.scan()
                         items = response.get('Items', [])
 
                         if not items:
-                            response_content = "Рецепты по данному запросу не найдены."
+                            response_content = t[lang]['not_found']
                         else:
                             if names_only:
-                                # "Table of contents" mode: return formatted names only
                                 matches = [item.get('OriginalName', item['RecipeId']) for item in items]
-                                response_content = "Список рецептов в базе: \n- " + "\n- ".join(matches)
+                                response_content = t[lang]['list_header'] + "\n- ".join(matches)
                             else:
-                                # Full search mode (limit to 5 items to avoid blowing up context window)
                                 matches = [{'name': item.get('OriginalName', item['RecipeId']), 'tags': item.get('Tags', ''), 'recipe': item.get('Content', '...')} for item in items][:5]
                                 response_content = json.dumps(matches, ensure_ascii=False)
 
@@ -158,11 +179,9 @@ Resources:
 
                             if 'Item' in response:
                                 original_name = response['Item'].get('OriginalName', recipe_name)
-                                
                                 update_expr = "set Content = :c"
                                 expr_attrs = {':c': new_content}
                                 
-                                # Update tags if provided
                                 if new_tags is not None and new_tags.strip():
                                     update_expr += ", Tags = :t"
                                     expr_attrs[':t'] = new_tags
@@ -172,17 +191,17 @@ Resources:
                                     UpdateExpression=update_expr,
                                     ExpressionAttributeValues=expr_attrs
                                 )
-                                response_content = f'Рецепт "{original_name}" успешно обновлен!'
+                                response_content = t[lang]['updated'].format(name=original_name)
                             else:
-                                response_content = f'Ошибка: Рецепт "{recipe_name}" не найден. Сначала найди его точное название.'
+                                response_content = t[lang]['update_not_found'].format(name=recipe_name)
                         else:
-                            response_content = "Ошибка: не передано имя или обновленный текст."
+                            response_content = t[lang]['update_err']
                     else:
-                        response_content = "Неизвестная операция."
+                        response_content = t[lang]['unknown_op']
 
                 except Exception as e:
                     print("DynamoDB Error:", e)
-                    response_content = f"Ошибка БД: {str(e)}"
+                    response_content = t[lang]['db_err'].format(err=str(e))
 
                 return {
                     "messageVersion": "1.0",
@@ -248,6 +267,7 @@ Resources:
           AGENT_ID: !Ref BedrockAgentId
           AGENT_ALIAS_ID: !Ref BedrockAgentAliasId
           ALLOWED_CHATS: !Join [",", !Ref AllowedTelegramUserIds]
+          LANGUAGE: !Ref BotLanguage
       Code:
         # language=python
         ZipFile: |
@@ -277,8 +297,26 @@ Resources:
                 tg_token = os.environ['TELEGRAM_TOKEN']
                 agent_id = os.environ['AGENT_ID']
                 agent_alias_id = os.environ['AGENT_ALIAS_ID']
+                lang = os.environ.get('LANGUAGE', 'RU')
+                
                 allowed_chats_raw = os.environ['ALLOWED_CHATS']
                 allowed_chats = [int(i.strip()) for i in allowed_chats_raw.split(',') if i.strip()]
+
+                # Dictionaries for localization
+                t = {
+                    'RU': {
+                        'cleared': '👨‍🍳 Память очищена! Готов к новому рецепту.',
+                        'vision_prompt': 'Внимательно прочитай весь текст рецепта с этой картинки. Если это не рецепт, просто опиши.',
+                        'agent_prompt': 'Я сфотографировал рецепт. Текст:\n\n{text}\n\nТвоя задача: ВЫВЕДИ ЭТОТ ТЕКСТ В MARKDOWN И СПРОСИ МОЕГО РАЗРЕШЕНИЯ НА СОХРАНЕНИЕ. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО вызывать функции сохранения до моего подтверждения. Мой комментарий: {caption}.',
+                        'error': '🚨 Ошибка в Лямбде: {err}'
+                    },
+                    'EN': {
+                        'cleared': '👨‍🍳 Memory cleared! Ready for a new recipe.',
+                        'vision_prompt': 'Carefully read all the recipe text from this image. If it is not a recipe, just describe what you see.',
+                        'agent_prompt': 'I took a photo of a recipe. Text:\n\n{text}\n\nYour task: FORMAT THIS TEXT AS MARKDOWN AND ASK FOR MY PERMISSION TO SAVE IT. IT IS STRICTLY FORBIDDEN to call save functions before I confirm. My comment: {caption}.',
+                        'error': '🚨 Lambda Error: {err}'
+                    }
+                }
 
                 if agent_id == 'PLACEHOLDER':
                     return {'statusCode': 200, 'body': 'Agent ID not configured'}
@@ -310,7 +348,7 @@ Resources:
                             inputText="End session", 
                             endSession=True
                         )
-                        send_message(tg_token, chat_id, '👨‍🍳 Память очищена! Готов к новому рецепту.')
+                        send_message(tg_token, chat_id, t[lang]['cleared'])
                         return {'statusCode': 200, 'body': 'OK'}
 
                     # 2. HANDLE PHOTOS
@@ -327,12 +365,12 @@ Resources:
                             modelId=vision_model_id,
                             messages=[{"role": "user", "content": [
                                 {"image": {"format": "jpeg", "source": {"bytes": image_bytes}}},
-                                {"text": "Внимательно прочитай весь текст рецепта с этой картинки. Если это не рецепт, просто опиши."}
+                                {"text": t[lang]['vision_prompt']}
                             ]}]
                         )
                         extracted_text = converse_response['output']['message']['content'][0]['text']
 
-                        agent_prompt = f"Я сфотографировал рецепт. Текст:\n\n{extracted_text}\n\nТвоя задача: ВЫВЕДИ ЭТОТ ТЕКСТ В MARKDOWN И СПРОСИ МОЕГО РАЗРЕШЕНИЯ НА СОХРАНЕНИЕ. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО вызывать функции сохранения до моего подтверждения. Мой комментарий: {caption}."
+                        agent_prompt = t[lang]['agent_prompt'].format(text=extracted_text, caption=caption)
                         
                         response = bedrock_agent.invoke_agent(
                             agentId=agent_id, agentAliasId=agent_alias_id,
@@ -356,7 +394,7 @@ Resources:
                         send_message(tg_token, chat_id, completion)
 
                 except Exception as e:
-                    error_info = f"🚨 Lambda Error: {str(e)}"
+                    error_info = t[lang]['error'].format(err=str(e))
                     print(error_info)
                     send_message(tg_token, chat_id, error_info)
 
