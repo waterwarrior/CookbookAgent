@@ -201,10 +201,20 @@ Always suggest saving useful generated recipes.
 
 ---
 
-## 📦 Deployment
+## 📦 Deployment Semi-Auto
 1. Create a Telegram Bot via [@BotFather](https://t.me/botfather) and get the token.
-2. Deploy the `cookbook.yaml` stack using AWS CloudFormation.
-3. Configure your Bedrock Agent with the instructions above.
+2. Get id of users which should have access to bot using [@userinfobot](https://t.me/userinfobot)
+3. Deploy the `cookbook.yaml` stack using AWS CloudFormation.
+4. Configure your Bedrock Agent with the instructions above.
+5. Set the Telegram Webhook using the `WebhookUrl` from CloudFormation outputs:
+   ```bash
+   curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook?url=<WebhookUrl>"
+6. update CloudFormation stack using telegram token, agentid, agentAliasId
+
+## 📦 Deployment Auto
+1. Create a Telegram Bot via [@BotFather](https://t.me/botfather) and get the token.
+2. Get id of users which should have access to bot using [@userinfobot](https://t.me/userinfobot)
+3. Deploy the `cookbook-auto.yaml` stack using AWS CloudFormation passing telegram token and list of users id.
 4. Set the Telegram Webhook using the `WebhookUrl` from CloudFormation outputs:
    ```bash
-   curl -X POST "[https://api.telegram.org/bot](https://api.telegram.org/bot)<YOUR_TOKEN>/setWebhook?url=<YOUR_WEBHOOK_URL>"
+   curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook?url=<WebhookUrl>"

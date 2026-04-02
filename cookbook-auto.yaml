@@ -1,0 +1,543 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SmartCookbook AI - Hybrid Deployment'
+
+Parameters:
+  TelegramBotToken:
+    Type: String
+    Description: 'Token received from BotFather'
+    NoEcho: true
+  AllowedTelegramUserIds:
+    Type: CommaDelimitedList
+    Description: 'Comma-separated list of allowed Telegram user IDs'
+    Default: ''
+  BotLanguage:
+    Type: String
+    Description: 'Language for bot responses (EN or RU)'
+    AllowedValues: ['EN', 'RU']
+    Default: 'EN'
+
+Resources:
+  # 1. DynamoDB Table
+  RecipeTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-RecipesTable'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: RecipeId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: RecipeId
+          KeyType: HASH
+
+  # 2. IAM Role for Action Group Lambda
+  BedrockActionGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource: !GetAtt RecipeTable.Arn
+
+  # 3. Action Group Lambda (Executor)
+  ActionGroupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ActionHandler'
+      Handler: index.lambda_handler
+      Role: !GetAtt BedrockActionGroupRole.Arn
+      Runtime: python3.12
+      Timeout: 15
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref RecipeTable
+          LANGUAGE: !Ref BotLanguage
+      Code:
+        # language=python
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from boto3.dynamodb.conditions import Attr
+
+          dynamodb = boto3.resource('dynamodb')
+
+          def lambda_handler(event, context):
+                print("Bedrock Agent called this:", json.dumps(event))
+                table_name = os.environ['TABLE_NAME']
+                lang = os.environ.get('LANGUAGE', 'RU')
+                table = dynamodb.Table(table_name)
+
+                # Dictionaries for localization
+                t = {
+                    'RU': {
+                        'saved': 'Рецепт "{name}" (Теги: {tags}) успешно сохранен!',
+                        'save_err': 'Ошибка: не передано имя или текст рецепта.',
+                        'not_found': 'Рецепты по данному запросу не найдены.',
+                        'list_header': 'Список рецептов в базе: \n- ',
+                        'updated': 'Рецепт "{name}" успешно обновлен!',
+                        'update_not_found': 'Ошибка: Рецепт "{name}" не найден. Сначала найди его точное название.',
+                        'update_err': 'Ошибка: не передано имя или обновленный текст.',
+                        'unknown_op': 'Неизвестная операция.',
+                        'db_err': 'Ошибка БД: {err}'
+                    },
+                    'EN': {
+                        'saved': 'Recipe "{name}" (Tags: {tags}) successfully saved!',
+                        'save_err': 'Error: recipe name or content not provided.',
+                        'not_found': 'No recipes found for this query.',
+                        'list_header': 'List of recipes in the database: \n- ',
+                        'updated': 'Recipe "{name}" successfully updated!',
+                        'update_not_found': 'Error: Recipe "{name}" not found. Please search for its exact name first.',
+                        'update_err': 'Error: recipe name or updated text not provided.',
+                        'unknown_op': 'Unknown operation.',
+                        'db_err': 'DB Error: {err}'
+                    }
+                }
+
+                session_id = event.get('sessionId', 'unknown_user')
+                response_content = ""
+                function_name = event.get('function', '')
+                params = event.get('parameters', [])
+
+                try:
+                    if function_name == 'save_recipe':
+                        recipe_name = next((p['value'] for p in params if p['name'] == 'recipe_name'), None)
+                        recipe_content = next((p['value'] for p in params if p['name'] == 'recipe_content'), None)
+                        tags = next((p['value'] for p in params if p['name'] == 'tags'), 'No tags' if lang == 'EN' else 'Без тегов')
+
+                        if recipe_name and recipe_content:
+                            table.put_item(Item={
+                                'RecipeId': recipe_name.lower(),
+                                'OriginalName': recipe_name,
+                                'Content': recipe_content,
+                                'UserId': session_id,
+                                'Tags': tags
+                            })
+                            response_content = t[lang]['saved'].format(name=recipe_name, tags=tags)
+                        else:
+                            response_content = t[lang]['save_err']
+
+                    elif function_name == 'search_recipes':
+                        keyword = next((p['value'] for p in params if p['name'] == 'keyword'), '').lower()
+                        only_my = next((p['value'] for p in params if p['name'] == 'only_my'), 'false').lower() == 'true'
+                        names_only = next((p['value'] for p in params if p['name'] == 'names_only'), 'false').lower() == 'true'
+
+                        fe = None
+                        if keyword:
+                            fe = Attr('RecipeId').contains(keyword) | Attr('Tags').contains(keyword)
+                        
+                        if only_my:
+                            user_fe = Attr('UserId').eq(session_id)
+                            fe = fe & user_fe if fe else user_fe
+
+                        response = table.scan(FilterExpression=fe) if fe else table.scan()
+                        items = response.get('Items', [])
+
+                        if not items:
+                            response_content = t[lang]['not_found']
+                        else:
+                            if names_only:
+                                matches = [item.get('OriginalName', item['RecipeId']) for item in items]
+                                response_content = t[lang]['list_header'] + "\n- ".join(matches)
+                            else:
+                                matches = [{'name': item.get('OriginalName', item['RecipeId']), 'tags': item.get('Tags', ''), 'recipe': item.get('Content', '...')} for item in items][:5]
+                                response_content = json.dumps(matches, ensure_ascii=False)
+
+                    elif function_name == 'update_recipe':
+                        recipe_name = next((p['value'] for p in params if p['name'] == 'recipe_name'), None)
+                        new_content = next((p['value'] for p in params if p['name'] == 'new_content'), None)
+                        new_tags = next((p['value'] for p in params if p['name'] == 'tags'), None)
+
+                        if recipe_name and new_content:
+                            recipe_id = recipe_name.lower()
+                            response = table.get_item(Key={'RecipeId': recipe_id})
+
+                            if 'Item' in response:
+                                original_name = response['Item'].get('OriginalName', recipe_name)
+                                update_expr = "set Content = :c"
+                                expr_attrs = {':c': new_content}
+                                
+                                if new_tags is not None and new_tags.strip():
+                                    update_expr += ", Tags = :t"
+                                    expr_attrs[':t'] = new_tags
+                                    
+                                table.update_item(
+                                    Key={'RecipeId': recipe_id},
+                                    UpdateExpression=update_expr,
+                                    ExpressionAttributeValues=expr_attrs
+                                )
+                                response_content = t[lang]['updated'].format(name=original_name)
+                            else:
+                                response_content = t[lang]['update_not_found'].format(name=recipe_name)
+                        else:
+                            response_content = t[lang]['update_err']
+                    else:
+                        response_content = t[lang]['unknown_op']
+
+                except Exception as e:
+                    print("DynamoDB Error:", e)
+                    response_content = t[lang]['db_err'].format(err=str(e))
+
+                return {
+                    "messageVersion": "1.0",
+                    "response": {
+                        "actionGroup": event.get('actionGroup', ''),
+                        "function": function_name,
+                        "functionResponse": {
+                            "responseBody": {
+                                "TEXT": {
+                                    "body": response_content
+                                }
+                            }
+                        }
+                    }
+                }
+
+  BedrockInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ActionGroupLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+
+  # 4. IAM Role for Bedrock Agent
+  BedrockAgentServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockAgentAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['bedrock:InvokeModel']
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/openai.gpt-oss-120b-1:0'
+              - Effect: Allow
+                Action: ['lambda:InvokeFunction']
+                Resource: !GetAtt ActionGroupLambda.Arn
+
+  # 5. Bedrock Agent with Embedded Action Group (No Alias creation here)
+  SmartCookbookAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Sub '${AWS::StackName}-Agent'
+      AgentResourceRoleArn: !GetAtt BedrockAgentServiceRole.Arn
+      FoundationModel: openai.gpt-oss-120b-1:0
+      IdleSessionTTLInSeconds: 3600
+      AutoPrepare: true
+      Instruction: |
+        ### Role and Objective
+        You are an intelligent and friendly AI culinary assistant. Your primary and ONLY goal is to help users with recipes: discussing cooking ideas, suggesting improvements, and managing a personal recipe collection.
+        
+        ---
+        
+        ### 🛑 Domain Restriction (Guardrails)
+        You must strictly stay within the cooking domain. If a request is unrelated to food, recipes, or ingredients, politely refuse:
+        
+        > "I'm just a chef and I specialize in food. Let's talk about something delicious instead!"
+        
+        ---
+        
+        ### ⚠️ Confirmation Rule (Critical)
+        You are STRICTLY FORBIDDEN from calling `save_recipe` or `update_recipe` without explicit user confirmation.
+        
+        Valid confirmations include:
+        - "yes"
+        - "save it"
+        - "ok"
+        - "go ahead"
+        
+        ---
+        
+        ### 📋 Behavior Guidelines
+        
+        #### 1. New Recipe (Text or Image)
+        1. DO NOT call `save_recipe` immediately
+        2. Convert the recipe into clean, structured Markdown:
+           - Title
+           - Ingredients list
+           - Step-by-step instructions
+        3. Show the result to the user
+        4. Ask:  
+           > "Does this look correct? Should I save this recipe?"
+        5. Only call `save_recipe` after confirmation
+        
+        ---
+        
+        #### 2. Updating Recipes
+        1. If needed, call `search_recipes` first
+        2. Generate a FULL updated version of the recipe
+        3. DO NOT call `update_recipe` immediately
+        4. Show updated version to the user
+        5. Ask for confirmation:
+           > "Should I update the recipe with these changes?"
+        6. Only call `update_recipe` after confirmation
+        
+        ---
+        
+        #### 3. Searching Recipes
+        1. Call `search_recipes`
+        2. Extract ONLY one keyword root in lowercase (e.g., "pancakes" → "pancake")
+        
+        Response format:
+        - If found:
+          > 📖 From your recipe collection:
+        - If not found:
+          > 🤖 I couldn't find it in your collection, but here's a suggestion:
+        
+        Always suggest saving useful generated recipes.
+        
+        ---
+        
+        ### 🎯 Style Guidelines
+        - Be concise and structured
+        - Avoid unnecessary verbosity
+        - Use Markdown formatting
+        - Sound like a professional chef, not a generic chatbot
+      ActionGroups:
+        - ActionGroupName: !Sub '${AWS::StackName}-Database'
+          ActionGroupState: ENABLED
+          ActionGroupExecutor:
+            Lambda: !GetAtt ActionGroupLambda.Arn
+          FunctionSchema:
+            Functions:
+              - Name: save_recipe
+                Description: 'Saves recipe after user confirmation.'
+                Parameters:
+                  recipe_name: { Type: string, Description: 'Title', Required: true }
+                  recipe_content: { Type: string, Description: 'Markdown content', Required: true }
+                  tags: { Type: string, Description: 'Tags', Required: false }
+              - Name: search_recipes
+                Description: 'Searches recipes by keyword.'
+                Parameters:
+                  keyword: { Type: string, Description: 'Search term', Required: true }
+              - Name: update_recipe
+                Description: 'Updates recipe after user confirmation.'
+                Parameters:
+                  recipe_name: { Type: string, Description: 'Exact name', Required: true }
+                  new_content: { Type: string, Description: 'Updated text', Required: true }
+
+  # 6. OFFICIAL Agent Alias Resource
+  SmartCookbookAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentId: !Ref SmartCookbookAgent
+      AgentAliasName: !Sub '${AWS::StackName}-ProdAlias'
+
+  # 7. IAM Role for Webhook
+  TelegramWebhookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockInvokeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeAgent
+                  - bedrock:InvokeModel
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Subscribe
+                Resource: "*"
+
+  # 8. Telegram Webhook Lambda
+  TelegramWebhookLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-Webhook'
+      Handler: index.lambda_handler
+      Role: !GetAtt TelegramWebhookRole.Arn
+      Runtime: python3.12
+      Timeout: 59
+      Environment:
+        Variables:
+          TELEGRAM_TOKEN: !Ref TelegramBotToken
+          ALLOWED_CHATS: !Join [",", !Ref AllowedTelegramUserIds]
+          LANGUAGE: !Ref BotLanguage
+          AGENT_ID: !Ref SmartCookbookAgent
+          AGENT_ALIAS_ID: !GetAtt SmartCookbookAgentAlias.AgentAliasId
+      Code:
+        # language=python
+        ZipFile: |
+          import json, os, boto3, urllib.request
+          bedrock_agent = boto3.client('bedrock-agent-runtime')
+          bedrock_runtime = boto3.client('bedrock-runtime')
+          def send_message(token, chat_id, text):
+                if not text or not text.strip():
+                    print("⚠️ Attempt to send an empty message to Telegram. Skipping.")
+                    return
+
+                print(f"📤 Sending message to chat {chat_id}: {text[:50]}...")
+                url = f"https://api.telegram.org/bot{token}/sendMessage"
+                payload = json.dumps({'chat_id': chat_id, 'text': text}).encode('utf-8')
+                req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
+                try:
+                    urllib.request.urlopen(req)
+                except Exception as e:
+                    print(f"❌ Error sending to Telegram: {str(e)}")
+
+          def lambda_handler(event, context):
+              tg_token = os.environ['TELEGRAM_TOKEN']
+              agent_id = os.environ['AGENT_ID']
+              agent_alias_id = os.environ['AGENT_ALIAS_ID']
+              lang = os.environ.get('LANGUAGE', 'RU')
+              
+              allowed_chats_raw = os.environ['ALLOWED_CHATS']
+              allowed_chats = [int(i.strip()) for i in allowed_chats_raw.split(',') if i.strip()]
+
+              # Dictionaries for localization
+              t = {
+                  'RU': {
+                      'cleared': '👨‍🍳 Память очищена! Готов к новому рецепту.',
+                      'vision_prompt': 'Внимательно прочитай весь текст рецепта с этой картинки. Если это не рецепт, просто опиши.',
+                      'agent_prompt': 'Я сфотографировал рецепт. Текст:\n\n{text}\n\nТвоя задача: ВЫВЕДИ ЭТОТ ТЕКСТ В MARKDOWN И СПРОСИ МОЕГО РАЗРЕШЕНИЯ НА СОХРАНЕНИЕ. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО вызывать функции сохранения до моего подтверждения. Мой комментарий: {caption}.',
+                      'error': '🚨 Ошибка в Лямбде: {err}'
+                  },
+                  'EN': {
+                      'cleared': '👨‍🍳 Memory cleared! Ready for a new recipe.',
+                      'vision_prompt': 'Carefully read all the recipe text from this image. If it is not a recipe, just describe what you see.',
+                      'agent_prompt': 'I took a photo of a recipe. Text:\n\n{text}\n\nYour task: FORMAT THIS TEXT AS MARKDOWN AND ASK FOR MY PERMISSION TO SAVE IT. IT IS STRICTLY FORBIDDEN to call save functions before I confirm. My comment: {caption}.',
+                      'error': '🚨 Lambda Error: {err}'
+                  }
+              }
+
+              if agent_id == 'PLACEHOLDER':
+                  return {'statusCode': 200, 'body': 'Agent ID not configured'}
+
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  
+                  if 'message' not in body:
+                      return {'statusCode': 200, 'body': 'OK'}
+
+                  chat_id = body['message']['chat']['id']
+
+                  if chat_id not in allowed_chats:
+                      print(f"🚫 Access denied for chat: {chat_id}")
+                      return {'statusCode': 200, 'body': 'OK'}
+
+                  user_text = body['message'].get('text', '')
+                  photo = body['message'].get('photo', None)
+                  caption = body['message'].get('caption', '')
+
+                  response = None
+
+                  # 1. HANDLE /new COMMAND
+                  if user_text.strip() == '/new':
+                      bedrock_agent.invoke_agent(
+                          agentId=agent_id, 
+                          agentAliasId=agent_alias_id,
+                          sessionId=str(chat_id), 
+                          inputText="End session", 
+                          endSession=True
+                      )
+                      send_message(tg_token, chat_id, t[lang]['cleared'])
+                      return {'statusCode': 200, 'body': 'OK'}
+
+                  # 2. HANDLE PHOTOS
+                  elif photo:
+                      file_id = photo[-1]['file_id']
+                      get_file_url = f"https://api.telegram.org/bot{tg_token}/getFile?file_id={file_id}"
+                      file_data = json.load(urllib.request.urlopen(get_file_url))
+                      file_path = file_data['result']['file_path']
+                      image_bytes = urllib.request.urlopen(f"https://api.telegram.org/file/bot{tg_token}/{file_path}").read()
+
+                      vision_model_id = 'us.anthropic.claude-sonnet-4-6'
+
+                      converse_response = bedrock_runtime.converse(
+                          modelId=vision_model_id,
+                          messages=[{"role": "user", "content": [
+                              {"image": {"format": "jpeg", "source": {"bytes": image_bytes}}},
+                              {"text": t[lang]['vision_prompt']}
+                          ]}]
+                      )
+                      extracted_text = converse_response['output']['message']['content'][0]['text']
+
+                      agent_prompt = t[lang]['agent_prompt'].format(text=extracted_text, caption=caption)
+                      
+                      response = bedrock_agent.invoke_agent(
+                          agentId=agent_id, agentAliasId=agent_alias_id,
+                          sessionId=str(chat_id), inputText=agent_prompt
+                      )
+
+                  # 3. HANDLE NORMAL TEXT
+                  elif user_text:
+                      response = bedrock_agent.invoke_agent(
+                          agentId=agent_id, agentAliasId=agent_alias_id,
+                          sessionId=str(chat_id), inputText=user_text
+                      )
+
+                  # PARSE AGENT RESPONSE
+                  if response:
+                      completion = ""
+                      for stream_event in response.get('completion', []):
+                          if 'chunk' in stream_event:
+                              completion += stream_event['chunk']['bytes'].decode('utf-8')
+
+                      send_message(tg_token, chat_id, completion)
+
+              except Exception as e:
+                  error_info = t[lang]['error'].format(err=str(e))
+                  print(error_info)
+                  send_message(tg_token, chat_id, error_info)
+
+              return {'statusCode': 200, 'body': 'OK'}
+
+  # 9. API Gateway
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties: { Name: !Sub '${AWS::StackName}-Gateway', ProtocolType: HTTP }
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties: { ApiId: !Ref HttpApi, IntegrationType: AWS_PROXY, IntegrationUri: !GetAtt TelegramWebhookLambda.Arn, PayloadFormatVersion: '2.0' }
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref HttpApi, RouteKey: 'POST /webhook', Target: !Join ['/', ['integrations', !Ref LambdaIntegration]] }
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties: { ApiId: !Ref HttpApi, StageName: prod, AutoDeploy: true }
+  ApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TelegramWebhookLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/webhook'
+
+Outputs:
+  WebhookUrl:
+    Value: !Join ['', [!GetAtt HttpApi.ApiEndpoint, '/prod/webhook']]
