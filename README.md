@@ -19,6 +19,15 @@
 * **Database:** Amazon DynamoDB.
 * **IaC:** AWS CloudFormation.
 
+### GCP / Terraform Variant
+The `terraform/` directory contains a GCP rewrite of `cookbook-auto.yaml`:
+* **LLMs:** Vertex AI Gemini for dialog, tool calling, and image extraction.
+* **Backend:** Cloud Functions Gen2 (Python 3.12).
+* **API:** Public HTTPS Cloud Run endpoint created by Cloud Functions Gen2.
+* **Database:** Firestore Native mode.
+* **Secrets:** Secret Manager for the Telegram bot token.
+* **IaC:** Terraform.
+
 ## Architecture Overview
 This project implements an event-driven, serverless architecture to ensure zero idle costs and high scalability. The core reasoning loop is delegated to Amazon Bedrock Agents, which orchestrate the interaction between the LLM, the Telegram user, and the persistent storage.
 
@@ -209,6 +218,7 @@ Always suggest saving useful generated recipes.
 5. Set the Telegram Webhook using the `WebhookUrl` from CloudFormation outputs:
    ```bash
    curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook?url=<WebhookUrl>"
+   ```
 6. update CloudFormation stack using telegram token, agentid, agentAliasId
 
 ## 📦 Deployment Auto
@@ -218,3 +228,28 @@ Always suggest saving useful generated recipes.
 4. Set the Telegram Webhook using the `WebhookUrl` from CloudFormation outputs:
    ```bash
    curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook?url=<WebhookUrl>"
+   ```
+
+## 📦 Deployment on GCP with Terraform
+1. Create a Telegram Bot via [@BotFather](https://t.me/botfather) and get the token.
+2. Get allowed Telegram user IDs using [@userinfobot](https://t.me/userinfobot).
+3. Authenticate with GCP and select the target project:
+   ```bash
+   gcloud auth application-default login
+   gcloud config set project <PROJECT_ID>
+   ```
+4. Create a local Terraform variables file:
+   ```bash
+   cd terraform
+   cp terraform.tfvars.example terraform.tfvars
+   ```
+5. Edit `terraform.tfvars` with `project_id`, `telegram_bot_token`, and `allowed_telegram_user_ids`.
+6. Deploy:
+   ```bash
+   terraform init
+   terraform apply
+   ```
+7. Register the Telegram webhook using the `telegram_webhook_url` output:
+   ```bash
+   curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook?url=<telegram_webhook_url>"
+   ```
